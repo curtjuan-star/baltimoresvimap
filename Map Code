@@ -1,0 +1,655 @@
+import pandas as pd
+import geopandas as gpd
+import folium
+from folium import MacroElement
+from jinja2 import Template
+import branca.colormap as cm
+
+def calculate_percentile_rank(series, reverse=False):
+    """CDC SVI Ranking formula: (R - 1) / (N - 1)"""
+    ascending_order = not reverse
+    ranks = series.rank(ascending=ascending_order, method='average')
+    min_rank = ranks.min()
+    max_rank = ranks.max()
+    if max_rank == min_rank:
+        return 0.0
+    return (ranks - min_rank) / (max_rank - min_rank)
+
+
+
+# 1. LOAD CSV
+
+df = pd.read_csv('Baltimore Vulnabilty.csv')
+
+
+df.columns = df.columns.str.strip()
+
+print("Available columns:", df.columns.tolist())
+
+
+# 2. SEA LEVEL RISE YEAR COLUMNS
+
+slr_years = ['RSL2005 (cm)', 'RSL2020 (cm)', 'RSL2030 (cm)', 'RSL2040 (cm)', 'RSL2050 (cm)', 'RSL2060 (cm)',
+             'RSL2070 (cm)', 'RSL2080 (cm)', 'RSL2090 (cm)', 'RSL2100 (cm)', 'RSL2110 (cm)', 'RSL2120 (cm)',
+             'RSL2130 (cm)', 'RSL2140 (cm)', 'RSL2150 (cm)']
+slr_heights_cm = [0, 11, 19, 27, 35, 43, 51, 59, 66, 73, 82, 90, 98, 107, 116]
+slr_height_by_col = dict(zip(slr_years, slr_heights_cm))
+
+missing_slr = [c for c in slr_years if c not in df.columns]
+if missing_slr:
+    raise KeyError(
+        f"These sea level rise year columns don't match the CSV: {missing_slr}\n"
+        f"Available columns are: {df.columns.tolist()}"
+    )
+
+
+# 3. STATIC METRIC
+
+static_metrics = [
+    'Percent of Families Living Under The Poverty Line',
+    'Affordability Index Rent (%)',
+    'Percent Over 25 Years Old With Less than HS Diploma',
+    'Percent of Female-Headed Households with Children Under 18',
+    'Percent over 65 Years Old',
+    'Racial Diversity Index (%)',
+    'No Vehicle Access Percentage',
+    'Unemployment Rate (%)',
+    'Rate of Housing Vouchers per 1,000 Rental Units',
+    'Percent of Household with Children Under 18',
+    'Rate of Clogged Storm Drain Reports per 1,000 Residents',
+]
+
+missing_static = [m for m in static_metrics if m not in df.columns]
+if missing_static:
+    raise KeyError(
+        f"These metrics don't match any column in the CSV: {missing_static}\n"
+        f"Available columns are: {df.columns.tolist()}\n"
+        "Check for typos, spacing, or capitalization differences."
+    )
+
+reverse_mapping = {
+    'Percent of Families Living Under The Poverty Line': False,
+    'Affordability Index Rent (%)': False,
+    'Percent Over 25 Years Old With Less than HS Diploma': False,
+    'Percent of Female-Headed Households with Children Under 18': False,
+    'Percent over 65 Over Years Old': False,
+    'Racial Diversity Index (%)': False,
+    'No Vehicle Access Percentage': False,
+    'Unemployment Rate (%)': False,
+    'Rate of Housing Vouchers per 1,000 Rental Units': False,
+    'Percent of Household with Children Under 18': False,
+    'Rate of Clogged Storm Drains Report per 1,000 Residents': False,
+}
+
+# Compute static ranks 
+static_rank_cols = []
+for metric in static_metrics:
+    col_name = f'{metric}_rank'
+    df[col_name] = calculate_percentile_rank(df[metric], reverse=reverse_mapping.get(metric, False))
+    static_rank_cols.append(col_name)
+
+df['static_score_sum'] = df[static_rank_cols].sum(axis=1)
+
+
+df['CSA2024'] = df['CSA2024'].str.strip()
+
+dup_names = df['CSA2024'][df['CSA2024'].duplicated()].unique()
+if len(dup_names) > 0:
+    raise ValueError(f"Duplicate 'CSA2024' values in metrics CSV -- fix before merging: {dup_names}")
+
+
+# 4. Load geometry determine ca
+
+print("Loading Baltimore CSA geographic boundaries")
+gdf = gpd.read_file("Community_Statistical_Areas_2020_8602756789985715764.geojson")
+gdf['CSA2020'] = gdf['CSA2020'].str.strip()
+
+gdf_projected = gdf.to_crs(epsg=2248)
+
+# Load the Critical Area geojson and match ca
+critical_area_gdf = gpd.read_file('Critical_Area (1).geojson')
+critical_area_projected = critical_area_gdf.to_crs(epsg=2248)
+
+
+buffer_100ft_gdf = critical_area_projected[critical_area_projected['zone'] == '100FT']
+
+
+other_critical_area_gdf = critical_area_projected[
+    (critical_area_projected['zone'] != '100FT')
+    & (critical_area_projected['zone'] != 'WATER')
+    & (critical_area_projected['zone'] != 'NON')
+]
+
+print(f"100-ft buffer polygons: {len(buffer_100ft_gdf)}")
+print(f"Other critical area polygons: {len(other_critical_area_gdf)}")
+print("Zone value counts:")
+print(critical_area_gdf['zone'].value_counts(dropna=False))
+
+
+buffer_100ft_union = buffer_100ft_gdf.union_all()
+other_critical_area_union = other_critical_area_gdf.union_all()
+
+
+def calculate_overlap_pct(csa_geometry, reference_union):
+    """Returns the fraction (0-1) of a CSA's area that intersects the reference geometry."""
+    csa_area = csa_geometry.area
+    if csa_area == 0:
+        return 0.0
+    intersection = csa_geometry.intersection(reference_union)
+    return intersection.area / csa_area
+
+
+gdf_projected['overlap_100ft_pct'] = gdf_projected.geometry.apply(
+    lambda geom: calculate_overlap_pct(geom, buffer_100ft_union)
+)
+gdf_projected['overlap_other_critical_pct'] = gdf_projected.geometry.apply(
+    lambda geom: calculate_overlap_pct(geom, other_critical_area_union)
+)
+
+
+gdf['overlap_100ft_pct'] = gdf_projected['overlap_100ft_pct']
+gdf['overlap_other_critical_pct'] = gdf_projected['overlap_other_critical_pct']
+
+print(gdf[['CSA2020', 'overlap_100ft_pct', 'overlap_other_critical_pct']]
+      .sort_values('overlap_100ft_pct', ascending=False).head(10))
+
+
+# b distance to shore
+#
+#
+
+water_gdf = critical_area_projected[critical_area_projected['zone'] == 'WATER'].copy()
+if len(water_gdf) == 0:
+    raise ValueError(
+        "No polygons found with zone == 'water'."
+    )
+
+
+water_gdf = water_gdf.explode(index_parts=False).reset_index(drop=True)
+water_gdf['area_acres'] = water_gdf.geometry.area / 43560.0
+
+print("Water polygon size (acres):")
+print(water_gdf['area_acres'].describe())
+
+MIN_MAIN_WATER_ACRES = 50  
+main_water_gdf = water_gdf[water_gdf['area_acres'] >= MIN_MAIN_WATER_ACRES]
+print(f"Kept {len(main_water_gdf)} of {len(water_gdf)} water polygons as 'main shoreline' "
+      f"(>= {MIN_MAIN_WATER_ACRES} acres)")
+
+main_shoreline_union = main_water_gdf.union_all()
+
+gdf_projected['dist_to_shoreline_ft'] = gdf_projected.geometry.distance(main_shoreline_union)
+
+
+
+RING_BOUNDARIES_FT = [0, 500, 1500, 3000, 6000, 10000, 15000, 20000]
+SHORELINE_DECAY_DISTANCE_FT = RING_BOUNDARIES_FT[-1]
+
+ring_buffers = [main_shoreline_union.buffer(d) for d in RING_BOUNDARIES_FT]
+ring_polygons = []
+ring_weights = []
+for i in range(len(ring_buffers) - 1):
+    ring_polygons.append(ring_buffers[i + 1].difference(ring_buffers[i]))
+    ring_midpoint_ft = (RING_BOUNDARIES_FT[i] + RING_BOUNDARIES_FT[i + 1]) / 2.0
+    ring_weights.append(max(0.0, 1.0 - ring_midpoint_ft / SHORELINE_DECAY_DISTANCE_FT))
+
+
+def compute_area_weighted_shoreline_proximity(csa_geometry):
+    csa_area = csa_geometry.area
+    if csa_area == 0:
+        return 0.0
+    total_weight = 0.0
+    for ring_poly, weight in zip(ring_polygons, ring_weights):
+        if weight <= 0.0:
+            continue
+        overlap_area = csa_geometry.intersection(ring_poly).area
+        total_weight += (overlap_area / csa_area) * weight
+    return total_weight
+
+
+gdf_projected['shoreline_proximity'] = gdf_projected.geometry.apply(
+    compute_area_weighted_shoreline_proximity
+)
+
+gdf['dist_to_shoreline_ft'] = gdf_projected['dist_to_shoreline_ft']
+gdf['shoreline_proximity'] = gdf_projected['shoreline_proximity']
+
+print(gdf[['CSA2020', 'dist_to_shoreline_ft', 'shoreline_proximity']]
+      .sort_values('shoreline_proximity', ascending=False).head(10))
+
+
+
+# 5. MEtrics+ geometry
+base = gdf.merge(df, left_on='CSA2020', right_on='CSA2024', how='inner')
+
+print("Unmatched CSAs after merge:", len(gdf) - len(base), "out of", len(gdf))
+if len(base) < len(gdf):
+    unmatched_boundaries = gdf[~gdf['CSA2020'].isin(df['CSA2024'])]['CSA2020'].tolist()
+    print("  CSAs in boundaries file with no metrics match:", unmatched_boundaries)
+
+
+# per year
+
+
+MAX_SLR_HEIGHT_CM = max(slr_heights_cm)  
+STATIC_MAX_POSSIBLE = len(static_metrics)  
+
+year_data = {}
+weighted_records = []
+
+for slr_col, height_cm in slr_height_by_col.items():
+    year_label = slr_col.split(' ')[0].replace('RSL', '')
+    year_gdf = base.copy()
+
+
+    BASELINE_SLR_PROGRESS = 0.0  # tune this based on: higher = more color already visible in 2005
+    raw_progress = height_cm / MAX_SLR_HEIGHT_CM if MAX_SLR_HEIGHT_CM > 0 else 0.0
+    slr_progress = BASELINE_SLR_PROGRESS + (1.0 - BASELINE_SLR_PROGRESS) * raw_progress
+
+    
+    year_gdf['normalized_static'] = year_gdf['static_score_sum'] / STATIC_MAX_POSSIBLE
+
+
+    year_gdf['weighted_score_sum'] = (
+        year_gdf['shoreline_proximity'] * slr_progress * (1.0 + year_gdf['normalized_static'])
+    )
+    year_gdf['slr_height_cm'] = height_cm
+    year_gdf['slr_progress'] = slr_progress
+
+    year_data[year_label] = year_gdf
+    for _, row in year_gdf.iterrows():
+        weighted_records.append({
+            'year_label': year_label,
+            'CSA2020': row['CSA2020'],
+            'weighted_score_sum': row['weighted_score_sum'],
+        })
+
+all_weighted_df = pd.DataFrame(weighted_records)
+
+#b.  SVI ranking (across every year)
+
+all_weighted_df['CUSTOM_SVI'] = calculate_percentile_rank(all_weighted_df['weighted_score_sum'], reverse=False)
+svi_lookup = all_weighted_df.set_index(['year_label', 'CSA2020'])['CUSTOM_SVI']
+
+for year_label, year_gdf in year_data.items():
+    year_gdf['CUSTOM_SVI'] = year_gdf['CSA2020'].map(lambda c, yl=year_label: svi_lookup.loc[(yl, c)])
+    year_data[year_label] = year_gdf.to_crs(epsg=4326)
+
+
+# 7. Building map now
+
+baltimore_coords = [39.2904, -76.6122]
+m = folium.Map(location=baltimore_coords, zoom_start=11, tiles="cartodbpositron")
+
+# toggled
+
+SCORE_FIELDS = {
+    'weighted': {
+        'label': 'Critical Area / Shoreline-Weighted Score',
+        'column': 'weighted_score_sum',
+        'vmin': all_weighted_df['weighted_score_sum'].min(),
+        'vmax': all_weighted_df['weighted_score_sum'].max(),
+    },
+    'svi': {
+        'label': 'Final SVI (0-1)',
+        'column': 'CUSTOM_SVI',
+        'vmin': 0.0,
+        'vmax': 1.0,
+    },
+    'static': {
+        'label': 'Static Vulnerability Score (no SLR / critical area)',
+        'column': 'static_score_sum',
+        'vmin': df['static_score_sum'].min(),
+        'vmax': df['static_score_sum'].max(),
+    },
+}
+SCORE_ORDER = ['static', 'weighted', 'svi']  # order shown in the toggle UI
+
+
+
+
+def make_style_function(column, vmin, vmax):
+    field_colormap = cm.LinearColormap(["#2ecc71", "#f1c40f", "#e74c3c"], vmin=vmin, vmax=vmax)
+
+    def style_function(feature):
+        val = feature["properties"].get(column)
+        return {
+            "fillColor": field_colormap(val) if val is not None else "#999999",
+            "color": "black",
+            "weight": 0.5,
+            "fillOpacity": 0.75,
+        }
+    return style_function
+
+
+def ordinal_suffix(n):
+    if 10 <= n % 100 <= 20:
+        return 'th'
+    return {1: 'st', 2: 'nd', 3: 'rd'}.get(n % 10, 'th')
+
+
+def format_percentile(rank_value):
+    if pd.isna(rank_value):
+        return 'N/A'
+    n = int(round(rank_value * 100))
+    return f'{n}{ordinal_suffix(n)} percentile'
+
+
+first_year = list(year_data.keys())[0]
+year_order = list(year_data.keys())  
+
+
+popup_static_fields = []
+popup_static_aliases = []
+for metric in static_metrics:
+    pct_col = f'{metric}_rank_pct'
+    popup_static_fields.append(metric)
+    popup_static_aliases.append(f'{metric}:')
+    popup_static_fields.append(pct_col)
+    popup_static_aliases.append(f'{metric} — Percentile Rank:')
+
+popup_slr_fields = slr_years
+popup_slr_aliases = [
+    f'SLR {col.split(" ")[0].replace("RSL", "")} (cm):' for col in slr_years
+]
+
+popup_fields = (
+    ['CSA2020']
+    + popup_static_fields
+    + popup_slr_fields
+    + ['dist_to_shoreline_ft', 'shoreline_proximity', 'slr_progress',
+       'static_score_sum', 'weighted_score_sum', 'CUSTOM_SVI']
+)
+popup_aliases = (
+    ['Neighborhood:']
+    + popup_static_aliases
+    + popup_slr_aliases
+    + ['Distance to Main Shoreline (ft):', 'Shoreline Proximity (0-1):', 'SLR Progress (0-1, this year):',
+       'Static Vulnerability Score (0–11):', 'Weighted Score (this year):',
+       'SVI Score (this year, 0–1):']
+)
+
+combo_layer_js_names = {year_label: {} for year_label in year_order}
+
+for year_label, year_gdf in year_data.items():
+    popup_gdf = year_gdf.copy()
+
+    for metric in static_metrics:
+        rank_col = f'{metric}_rank'
+        pct_col = f'{metric}_rank_pct'
+        popup_gdf[pct_col] = popup_gdf[rank_col].apply(format_percentile)
+
+    numeric_popup_cols = [
+        c for c in popup_fields
+        if c in popup_gdf.columns and pd.api.types.is_numeric_dtype(popup_gdf[c])
+    ]
+    popup_gdf[numeric_popup_cols] = popup_gdf[numeric_popup_cols].round(3)
+
+    for score_key in SCORE_ORDER:
+        spec = SCORE_FIELDS[score_key]
+        
+        show_layer = (year_label == first_year and score_key == SCORE_ORDER[0])
+
+
+        is_control_entry = (score_key == SCORE_ORDER[0])
+        fg = folium.FeatureGroup(
+            name=year_label if is_control_entry else f"{spec['label']} — {year_label}",
+            show=show_layer,
+            control=is_control_entry,
+        )
+
+        folium.GeoJson(
+            popup_gdf,
+            style_function=make_style_function(spec['column'], spec['vmin'], spec['vmax']),
+            popup=folium.GeoJsonPopup(
+                fields=popup_fields,
+                aliases=popup_aliases,
+                localize=True,
+                labels=True,
+                max_width=250,
+                max_height=200,
+            ),
+        ).add_to(fg)
+
+        fg.add_to(m)
+        combo_layer_js_names[year_label][score_key] = fg.get_name()
+
+
+
+
+buffer_100ft_wgs84 = buffer_100ft_gdf.to_crs(epsg=4326)
+other_critical_wgs84 = other_critical_area_gdf.to_crs(epsg=4326)
+
+critical_100ft_fg = folium.FeatureGroup(name="Critical Area — 100ft Buffer", show=False)
+folium.GeoJson(
+    buffer_100ft_wgs84,
+    style_function=lambda feature: {
+        "fillColor": "#3388ff",
+        "color": "#3388ff",
+        "weight": 1,
+        "fillOpacity": 0.35,
+    },
+    tooltip=folium.GeoJsonTooltip(fields=['zone'], aliases=['Critical Area Zone:']) if 'zone' in buffer_100ft_wgs84.columns else None,
+).add_to(critical_100ft_fg)
+critical_100ft_fg.add_to(m)
+
+other_critical_fg = folium.FeatureGroup(name="Critical Area - Other", show=False)
+folium.GeoJson(
+    other_critical_wgs84,
+    style_function=lambda feature: {
+        "fillColor": "#9b59b6",
+        "color": "#9b59b6",
+        "weight": 1,
+        "fillOpacity": 0.35,
+    },
+    tooltip=folium.GeoJsonTooltip(fields=['zone'], aliases=['Critical Area Zone:']) if 'zone' in other_critical_wgs84.columns else None,
+).add_to(other_critical_fg)
+other_critical_fg.add_to(m)
+#independently of whichever year/score combo
+
+folium.LayerControl(collapsed=True).add_to(m)
+
+
+class YearScoreSlider(MacroElement):
+    """Combines a year slider (index into year_order, since years are not
+    evenly spaced), a set of radio buttons for score type, and a single
+    self-updating gradient legend, all inside ONE collapsible panel.
+
+    Collapsible + a media query keep this usable on narrow phone screens,
+    where the previous version (year slider + score radios + separate
+    branca legends + an expanded LayerControl) all fought for the same
+    space at once.
+    """
+
+    _template = Template(u"""
+        {% macro script(this, kwargs) %}
+        // ---- one-time responsive/collapsible styling ----------------------
+        var yssStyle = document.createElement('style');
+        yssStyle.innerHTML = `
+            .yss-panel {
+                background: white;
+                font-family: sans-serif;
+                width: 240px;
+                max-width: 78vw;
+                box-sizing: border-box;
+                box-shadow: 0 1px 5px rgba(0,0,0,0.4);
+                border-radius: 4px;
+                overflow: hidden;
+            }
+            .yss-header {
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                padding: 8px 10px;
+                font-weight: bold;
+                cursor: pointer;
+                background: #f4f4f4;
+                font-size: 13px;
+            }
+            .yss-body { padding: 8px 10px 10px 10px; }
+            .yss-panel.collapsed .yss-body { display: none; }
+            .yss-score-label { display: block; font-size: 12px; margin: 2px 0; }
+            .yss-legend-bar {
+                height: 10px;
+                border-radius: 2px;
+                background: linear-gradient(to right, #2ecc71, #f1c40f, #e74c3c);
+                margin: 4px 0 2px 0;
+            }
+            .yss-legend-labels {
+                display: flex;
+                justify-content: space-between;
+                font-size: 10px;
+                color: #444;
+            }
+            @media (max-width: 480px) {
+                .yss-panel { width: 210px; max-width: 82vw; }
+                .yss-header { font-size: 12px; padding: 6px 8px; }
+                .yss-body { padding: 6px 8px 8px 8px; }
+                .yss-score-label { font-size: 11px; }
+                input[type="range"] { height: 22px; }
+            }
+        `;
+        document.head.appendChild(yssStyle);
+
+        var yearOrder = {{ this.year_order|tojson }};
+        var scoreOrder = {{ this.score_order|tojson }};
+        var scoreLabels = {{ this.score_labels|tojson }};
+        var scoreRanges = {{ this.score_ranges|tojson }};  // {key: [vmin, vmax]}
+
+        // comboLayers[year][scoreKey] = folium layer object
+        var comboLayers = {
+            {% for year, score_map in this.layer_map.items() %}
+            "{{ year }}": {
+                {% for score_key, layer_name in score_map.items() %}
+                "{{ score_key }}": {{ layer_name }},
+                {% endfor %}
+            },
+            {% endfor %}
+        };
+
+        var allComboLayers = [];
+        yearOrder.forEach(function(y) {
+            scoreOrder.forEach(function(s) {
+                allComboLayers.push(comboLayers[y][s]);
+            });
+        });
+
+        var currentYearIdx = {{ this.default_year_index }};
+        var currentScoreKey = "{{ this.default_score_key }}";
+
+        function fmtNum(n) {
+            return (Math.round(n * 100) / 100).toString();
+        }
+
+        function refreshView() {
+            var year = yearOrder[currentYearIdx];
+            allComboLayers.forEach(function(layer) {
+                {{ this._parent.get_name() }}.removeLayer(layer);
+            });
+            {{ this._parent.get_name() }}.addLayer(comboLayers[year][currentScoreKey]);
+            document.getElementById('yearSliderLabel').innerHTML = year;
+
+            var range = scoreRanges[currentScoreKey];
+            document.getElementById('yssLegendMin').innerHTML = fmtNum(range[0]);
+            document.getElementById('yssLegendMax').innerHTML = fmtNum(range[1]);
+            document.getElementById('yssLegendCaption').innerHTML = scoreLabels[currentScoreKey];
+        }
+
+        var YearScoreControl = L.Control.extend({
+            options: {position: 'topleft'},
+            onAdd: function(map) {
+                var container = L.DomUtil.create('div', 'leaflet-bar yss-panel');
+
+                var scoreButtonsHtml = '';
+                scoreOrder.forEach(function(key) {
+                    var checked = (key === currentScoreKey) ? 'checked' : '';
+                    scoreButtonsHtml +=
+                        '<label class="yss-score-label">' +
+                        '<input type="radio" name="scoreToggle" value="' + key + '" ' + checked + '> ' +
+                        scoreLabels[key] + '</label>';
+                });
+
+                container.innerHTML =
+                    '<div class="yss-header" id="yssHeader">' +
+                    '<span>Year: <span id="yearSliderLabel">{{ this.default_year }}</span></span>' +
+                    '<span id="yssToggleIcon">&#9650;</span>' +
+                    '</div>' +
+                    '<div class="yss-body">' +
+                        '<input type="range" id="yearSlider" min="0" max="' + (yearOrder.length - 1) +
+                        '" step="1" value="{{ this.default_year_index }}" style="width:100%; margin-bottom:8px;">' +
+                        '<div style="font-weight:bold; margin-bottom:2px; font-size:12px;">Score:</div>' +
+                        scoreButtonsHtml +
+                        '<div id="yssLegendCaption" style="font-size:11px; font-weight:bold; margin-top:6px;"></div>' +
+                        '<div class="yss-legend-bar"></div>' +
+                        '<div class="yss-legend-labels">' +
+                            '<span id="yssLegendMin"></span>' +
+                            '<span id="yssLegendMax"></span>' +
+                        '</div>' +
+                    '</div>';
+
+                L.DomEvent.disableClickPropagation(container);
+                return container;
+            }
+        });
+        {{ this._parent.get_name() }}.addControl(new YearScoreControl());
+
+        // Collapse/expand toggle (collapsed by default on narrow screens
+        // so the panel doesn't sit on top of the map).
+        var yssPanelEl = document.querySelector('.yss-panel');
+        if (window.innerWidth <= 480) {
+            yssPanelEl.classList.add('collapsed');
+            document.getElementById('yssToggleIcon').innerHTML = '&#9660;';
+        }
+        document.getElementById('yssHeader').addEventListener('click', function() {
+            yssPanelEl.classList.toggle('collapsed');
+            var collapsedNow = yssPanelEl.classList.contains('collapsed');
+            document.getElementById('yssToggleIcon').innerHTML = collapsedNow ? '&#9660;' : '&#9650;';
+        });
+
+        document.getElementById('yearSlider').addEventListener('input', function(e) {
+            currentYearIdx = parseInt(e.target.value, 10);
+            refreshView();
+        });
+
+        document.querySelectorAll('input[name="scoreToggle"]').forEach(function(radio) {
+            radio.addEventListener('change', function(e) {
+                currentScoreKey = e.target.value;
+                refreshView();
+            });
+        });
+
+        // Initialize legend text for the default score on first load.
+        refreshView();
+        {% endmacro %}
+    """)
+
+    def __init__(self, layer_map, year_order, score_order, score_labels, score_ranges,
+                 default_year, default_score_key):
+        super().__init__()
+        self._name = "YearScoreSlider"
+        self.layer_map = layer_map
+        self.year_order = year_order
+        self.score_order = score_order
+        self.score_labels = score_labels
+        self.score_ranges = score_ranges
+        self.default_year = str(default_year)
+        self.default_year_index = year_order.index(str(default_year))
+        self.default_score_key = default_score_key
+
+
+score_labels_lookup = {key: SCORE_FIELDS[key]['label'] for key in SCORE_ORDER}
+score_ranges_lookup = {key: [SCORE_FIELDS[key]['vmin'], SCORE_FIELDS[key]['vmax']] for key in SCORE_ORDER}
+
+m.add_child(YearScoreSlider(
+    combo_layer_js_names,
+    year_order,
+    SCORE_ORDER,
+    score_labels_lookup,
+    score_ranges_lookup,
+    first_year,
+    SCORE_ORDER[0],
+))
+
+
+m.save('baltimore_coastal_weighted_svi.html')
+print("Map successful")
